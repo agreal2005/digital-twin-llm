@@ -262,7 +262,7 @@ class ContextBuilder:
         
         for node in bundle.topology:
             emoji = status_emojis.get(node.status, "❓")
-            lines.append(f"{emoji} {node.name} ({node.type}): {node.status}")
+            lines.append(f"{emoji} {node.name} [id: {node.id}] ({node.type}): {node.status}")
             if node.neighbors:
                 lines.append(f"   Connected to: {', '.join(node.neighbors[:3])}")
         
