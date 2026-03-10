@@ -1,0 +1,6 @@
+# requirements.txt - Python 3.10+
+fastapi==0.115.11          # Latest stable as of Feb 2025
+uvicorn[standard]==0.34.0  # Latest ASGI server
+pydantic==2.10.6           # Pydantic v2 (Python 3.10+)
+python-dotenv==1.0.1       # Environment variables
+# llama-cpp-python==0.3.3    # Latest with Python 3.10 support
