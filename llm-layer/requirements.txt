@@ -1,6 +1,24 @@
-# requirements.txt - Python 3.10+
-fastapi==0.115.11          # Latest stable as of Feb 2025
-uvicorn[standard]==0.34.0  # Latest ASGI server
-pydantic==2.10.6           # Pydantic v2 (Python 3.10+)
-python-dotenv==1.0.1       # Environment variables
-# llama-cpp-python==0.3.3    # Latest with Python 3.10 support
+# Core API
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# LLM inference
+llama-cpp-python>=0.2.56
+
+# InfluxDB
+influxdb-client>=1.40.0
+
+# Neo4j
+neo4j>=5.17.0
+
+# ChromaDB + embeddings
+chromadb>=0.4.22
+sentence-transformers>=2.6.0
+
+# HTTP client (for Control Layer dispatch)
+httpx>=0.27.0
+
+# Utilities
+python-dateutil>=2.9.0

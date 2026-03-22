@@ -34,7 +34,6 @@ Keep responses focused and under 200 words unless a detailed explanation is need
 def _build_llama_prompt(system: str, user: str) -> str:
     """Format prompt using Llama 3.2 Instruct chat template."""
     return (
-        f"<|begin_of_text|>"
         f"<|start_header_id|>system<|end_header_id|>\n{system}<|eot_id|>"
         f"<|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|>"
         f"<|start_header_id|>assistant<|end_header_id|>\n"
