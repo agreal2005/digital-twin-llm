@@ -1,518 +1,577 @@
 """
-context_builder.py
-==================
-RAG pipeline for the LLM Layer.
-
-Retrieves relevant network context from three live data stores:
-  - InfluxDB   : recent telemetry metrics
-  - Neo4j      : topology graph (devices, links, paths)
-  - ChromaDB   : semantic search over runbooks, configs, incidents
-
-Compresses all retrieved data into a token-budget-aware text block
-for the Prompt Engine.
-
-Set CONTEXT_BUILDER_MODE=stub in env to fall back to stub data
-(useful when databases are unavailable during development).
+context_builder.py - handles both table and CSV output from Neo4j bridge
 """
 
 import os
 import re
+import socket
+import time
 import logging
-from typing   import Optional
-from datetime import datetime, timedelta, timezone
+import sys
+from typing import Optional
+from datetime import datetime
 
+logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config — read from environment (same pattern as config.py)
+# Config
 # ---------------------------------------------------------------------------
-INFLUX_URL    = os.getenv("INFLUX_URL",    "http://localhost:8086")
-INFLUX_TOKEN  = os.getenv("INFLUX_TOKEN",  "my-super-secret-token")
-INFLUX_ORG    = os.getenv("INFLUX_ORG",    "digital-twin")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "network-metrics")
+NEO4J_BRIDGE_HOST = os.getenv("NEO4J_BRIDGE_HOST", "127.0.0.1")
+NEO4J_BRIDGE_PORT = int(os.getenv("NEO4J_BRIDGE_PORT", "12345"))
+NEO4J_BRIDGE_TIMEOUT = int(os.getenv("NEO4J_BRIDGE_TIMEOUT", "15"))
 
-NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
-NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
-
-CHROMA_PATH       = os.getenv("CHROMA_PATH",       "./chroma_store")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_store")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "network-knowledge")
 
-# Set to "stub" to bypass real DB calls
 MODE = os.getenv("CONTEXT_BUILDER_MODE", "live").lower()
+print(f"🔧 CONTEXT_BUILDER_MODE = {MODE}", file=sys.stderr)
 
-# Token budget: max chars in final context block (~4 chars/token, 1800 token limit)
 MAX_CONTEXT_CHARS = 7200
-
-# Regex to extract device IDs like router-1, switch-2, server-3
-DEVICE_ID_RE = re.compile(r'\b([a-zA-Z]+-\d+)\b')
+DEVICE_ID_RE = re.compile(r'\b([a-zA-Z]+)[\s-]?(\d+)\b', re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
-
 class TopologyNode:
-    def __init__(self, id, type, name, status, ip="", location="", neighbors=None):
-        self.id        = id
-        self.type      = type
-        self.name      = name
-        self.status    = status
-        self.ip        = ip
-        self.location  = location
+    def __init__(self, id, type, name, status, ip="", location="", neighbors=None, cpu=None, memory=None):
+        self.id = id
+        self.type = type
+        self.name = name
+        self.status = status
+        self.ip = ip
+        self.location = location
         self.neighbors = neighbors or []
+        self.cpu = cpu
+        self.memory = memory
 
 class TelemetryData:
     def __init__(self, device_id, metric, value, unit, timestamp=None):
         self.device_id = device_id
-        self.metric    = metric
-        self.value     = value
-        self.unit      = unit
+        self.metric = metric
+        self.value = value
+        self.unit = unit
         self.timestamp = timestamp or datetime.now()
 
 class SemanticDoc:
     def __init__(self, id, title, content, relevance_score, category=""):
-        self.id              = id
-        self.title           = title
-        self.content         = content
+        self.id = id
+        self.title = title
+        self.content = content
         self.relevance_score = relevance_score
-        self.category        = category
+        self.category = category
 
 class ContextBundle:
     def __init__(self, query, topology=None, telemetry=None, docs=None):
-        self.query     = query
-        self.topology  = topology  or []
+        self.query = query
+        self.topology = topology or []
         self.telemetry = telemetry or []
-        self.docs      = docs      or []
+        self.docs = docs or []
+        self.blast_radius = []
         self.timestamp = datetime.now()
 
 
 # ---------------------------------------------------------------------------
-# InfluxDB client
+# Neo4j Bridge Client - supports CSV and table output
 # ---------------------------------------------------------------------------
+class Neo4jBridgeClient:
+    PROMPT = b"neo4j> "
+    ENCODING = "utf-8"
 
-class InfluxDBContextClient:
     def __init__(self):
-        from influxdb_client import InfluxDBClient
-        self._client    = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-        self._query_api = self._client.query_api()
-        logger.info("✅ InfluxDB client connected")
+        print(f"🟡 Connecting to Neo4j bridge at {NEO4J_BRIDGE_HOST}:{NEO4J_BRIDGE_PORT}...", file=sys.stderr)
+        self._test_connection()
+        print(f"✅ Neo4j bridge connected", file=sys.stderr)
 
-    def get_recent_metrics(
-        self,
-        device_ids: Optional[list] = None,
-        window_minutes: int = 5,
-        metrics: Optional[list] = None,
-    ) -> list[TelemetryData]:
-        """
-        Query the last `window_minutes` of metrics.
-        Filters by device_ids if provided.
-        """
-        # Build optional filter clauses
-        device_filter = ""
-        if device_ids:
-            ids_str = " or ".join(f'r["device_id"] == "{d}"' for d in device_ids)
-            device_filter = f'|> filter(fn: (r) => {ids_str})'
-
-        metric_filter = ""
-        if metrics:
-            fields = " or ".join(f'r["_field"] == "{m}"' for m in metrics)
-            metric_filter = f'|> filter(fn: (r) => {fields})'
-
-        flux = f"""
-from(bucket: "{INFLUX_BUCKET}")
-  |> range(start: -{window_minutes}m)
-  |> filter(fn: (r) => r["_measurement"] == "device_metrics")
-  {device_filter}
-  {metric_filter}
-  |> last()
-"""
+    def _test_connection(self):
+        sock = None
         try:
-            tables = self._query_api.query(flux, org=INFLUX_ORG)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(NEO4J_BRIDGE_TIMEOUT)
+            sock.connect((NEO4J_BRIDGE_HOST, NEO4J_BRIDGE_PORT))
+            self._read_until_prompt(sock)
         except Exception as e:
-            logger.error(f"InfluxDB query failed: {e}")
+            print(f"❌ Neo4j bridge test failed: {e}", file=sys.stderr)
+            raise
+        finally:
+            if sock:
+                try:
+                    sock.sendall(b"exit\n")
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+                sock.close()
+
+    def _read_until_prompt(self, sock: socket.socket, timeout: float = 5.0) -> str:
+        buf = b""
+        sock.settimeout(timeout)
+        start_time = time.time()
+        while True:
+            if time.time() - start_time > timeout:
+                break
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except socket.error:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if self.PROMPT in buf:
+                idx = buf.rfind(self.PROMPT)
+                return buf[:idx].decode(self.ENCODING, errors="replace")
+        return buf.decode(self.ENCODING, errors="replace")
+
+    def run_query(self, cypher: str) -> str:
+        # Flatten query to a single line with single spaces
+        flattened = ' '.join(cypher.split())
+        if not flattened.endswith(";"):
+            flattened += ";"
+        print(f"\n📤 [CYPHER QUERY]\n{flattened}\n", file=sys.stderr)
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(NEO4J_BRIDGE_TIMEOUT)
+            sock.connect((NEO4J_BRIDGE_HOST, NEO4J_BRIDGE_PORT))
+            self._read_until_prompt(sock)
+            sock.sendall((flattened + "\n").encode(self.ENCODING))
+            # Read until next prompt (includes echoed query)
+            response = self._read_until_prompt(sock)
+            # Remove the echoed query line if present
+            lines = response.splitlines()
+            if lines and flattened.strip() in lines[0]:
+                response = '\n'.join(lines[1:])
+            sock.sendall(b"exit\n")
+            time.sleep(0.1)
+            print(f"📥 [RESPONSE LENGTH] {len(response)} chars", file=sys.stderr)
+            if len(response) < 1000:
+                print(f"📥 [RESPONSE]\n{response}\n", file=sys.stderr)
+            else:
+                print(f"📥 [RESPONSE (first 500)]\n{response[:500]}...\n", file=sys.stderr)
+            return response
+        except Exception as e:
+            print(f"❌ run_query error: {e}", file=sys.stderr)
+            raise
+        finally:
+            if sock:
+                sock.close()
+
+    @staticmethod
+    def _parse_csv_line(line: str) -> list:
+        """Parse a CSV line respecting quotes and brackets."""
+        result = []
+        current = ""
+        in_quotes = False
+        in_brackets = 0
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == '"' and not in_brackets:
+                in_quotes = not in_quotes
+                current += ch
+            elif ch == '[' and not in_quotes:
+                in_brackets += 1
+                current += ch
+            elif ch == ']' and not in_quotes and in_brackets > 0:
+                in_brackets -= 1
+                current += ch
+            elif ch == ',' and not in_quotes and in_brackets == 0:
+                result.append(Neo4jBridgeClient._parse_cell(current.strip()))
+                current = ""
+            else:
+                current += ch
+            i += 1
+        if current:
+            result.append(Neo4jBridgeClient._parse_cell(current.strip()))
+        return result
+
+    @staticmethod
+    def _parse_table(raw: str) -> list[dict]:
+        """Parse either ASCII table (|) or CSV output into list of dicts."""
+        lines = raw.strip().splitlines()
+        if not lines:
             return []
+        # Check first non-empty line for table format
+        first_line = next((l.strip() for l in lines if l.strip()), "")
+        if first_line.startswith('|'):
+            # --- ASCII table format ---
+            header_line = None
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("|") and not stripped.startswith("|--") and not stripped.startswith("+-"):
+                    if not any(kw in stripped.lower() for kw in ["match", "return", "where", "cypher"]):
+                        header_line = stripped
+                        break
+            if not header_line:
+                print("⚠️ No table header found", file=sys.stderr)
+                return []
+            columns = [c.strip() for c in header_line.strip("|").split("|") if c.strip()]
+            rows = []
+            in_data = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("|") and not stripped.startswith("|--") and not stripped.startswith("+-"):
+                    if not in_data:
+                        in_data = True
+                        continue
+                    if "rows available" in stripped.lower() or "ms" in stripped.lower():
+                        continue
+                    cells = stripped.strip("|").split("|")
+                    if len(cells) != len(columns):
+                        continue
+                    row = {}
+                    for col, cell in zip(columns, cells):
+                        row[col] = Neo4jBridgeClient._parse_cell(cell.strip())
+                    rows.append(row)
+            return rows
+        else:
+            # --- CSV style output (no header) ---
+            rows = []
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("rows available") or line.startswith("+"):
+                    continue
+                values = Neo4jBridgeClient._parse_csv_line(line)
+                if values:
+                    # Return dict with numeric keys (col0, col1, ...)
+                    row = {f"col{i}": val for i, val in enumerate(values)}
+                    rows.append(row)
+            return rows
 
-        # Unit mapping for fields
-        unit_map = {
-            "cpu_usage":      "%",
-            "memory_usage":   "%",
-            "latency_ms":     "ms",
-            "packet_loss":    "%",
-            "bandwidth_mbps": "Mbps",
-            "error_rate":     "err/s",
-        }
+    @staticmethod
+    def _parse_cell(cell: str):
+        c = cell.strip()
+        if c in ("<null>", "null", "NULL", ""):
+            return None
+        if c.startswith("[") and c.endswith("]"):
+            inner = c[1:-1].strip()
+            if not inner:
+                return []
+            # Simple split for lists (assumes no nested commas inside quotes)
+            items = []
+            current = ""
+            in_quotes = False
+            for ch in inner:
+                if ch == '"' and not in_quotes:
+                    in_quotes = True
+                    current += ch
+                elif ch == '"' and in_quotes:
+                    in_quotes = False
+                    current += ch
+                elif ch == ',' and not in_quotes:
+                    items.append(Neo4jBridgeClient._parse_cell(current.strip()))
+                    current = ""
+                else:
+                    current += ch
+            if current.strip():
+                items.append(Neo4jBridgeClient._parse_cell(current.strip()))
+            return items
+        if (c.startswith('"') and c.endswith('"')) or (c.startswith("'") and c.endswith("'")):
+            return c[1:-1]
+        try:
+            return int(c)
+        except ValueError:
+            pass
+        try:
+            return float(c)
+        except ValueError:
+            pass
+        return c
 
+    # ------------------------------------------------------------------
+    # Public Methods
+    # ------------------------------------------------------------------
+
+    def get_telemetry(self, node_names: Optional[list] = None) -> list[TelemetryData]:
+        if node_names and len(node_names) > 0:
+            names_str = ", ".join(f'"{n}"' for n in node_names)
+            cypher = f"MATCH (n:NetworkNode) WHERE n.name IN [{names_str}] RETURN n.name AS device_id, n.cpu AS cpu, n.memory AS memory, n.packet_loss AS packet_loss, n.bandwidth AS bandwidth, n.latency AS latency"
+        else:
+            cypher = "MATCH (n:NetworkNode) RETURN n.name AS device_id, n.cpu AS cpu, n.memory AS memory, n.packet_loss AS packet_loss, n.bandwidth AS bandwidth, n.latency AS latency"
+        try:
+            raw = self.run_query(cypher)
+            rows = self._parse_table(raw)
+        except Exception as e:
+            print(f"❌ get_telemetry failed: {e}", file=sys.stderr)
+            return []
         results = []
-        for table in tables:
-            for record in table.records:
-                results.append(TelemetryData(
-                    device_id = record.values.get("device_id", "unknown"),
-                    metric    = record.get_field(),
-                    value     = round(float(record.get_value()), 2),
-                    unit      = unit_map.get(record.get_field(), ""),
-                    timestamp = record.get_time(),
-                ))
+        now = datetime.now()
+        for row in rows:
+            device_id = row.get('col0')
+            if not device_id:
+                continue
+            device_id = str(device_id)
+            cpu = row.get('col1')
+            memory = row.get('col2')
+            packet_loss = row.get('col3')
+            bandwidth = row.get('col4')
+            latency = row.get('col5')
+            # Map to TelemetryData
+            metrics_map = [
+                (cpu, "cpu_usage", "%"),
+                (memory, "memory_usage", "%"),
+                (packet_loss, "packet_loss", "%"),
+                (bandwidth, "bandwidth_mbps", "Mbps"),
+                (latency, "latency_ms", "ms"),
+            ]
+            for value, metric_name, unit in metrics_map:
+                if value is not None and str(value).lower() not in ("null", "none", ""):
+                    try:
+                        numeric_value = float(value)
+                        results.append(TelemetryData(
+                            device_id=device_id,
+                            metric=metric_name,
+                            value=round(numeric_value, 2),
+                            unit=unit,
+                            timestamp=now
+                        ))
+                    except (ValueError, TypeError):
+                        pass
         return results
 
-
-# ---------------------------------------------------------------------------
-# Neo4j client
-# ---------------------------------------------------------------------------
-
-class Neo4jContextClient:
-    def __init__(self):
-        from neo4j import GraphDatabase
-        self._driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        logger.info("✅ Neo4j client connected")
-
-    def get_topology(self, device_ids: Optional[list] = None) -> list[TopologyNode]:
-        """
-        Fetch device nodes and their direct neighbours.
-        If device_ids provided, fetch only those devices + their neighbours.
-        """
-        with self._driver.session() as session:
-            if device_ids:
-                result = session.run("""
-                    MATCH (d:Device)
-                    WHERE d.id IN $ids
-                    OPTIONAL MATCH (d)-[:CONNECTED_TO]->(n:Device)
-                    RETURN d.id AS id, d.name AS name, d.type AS type,
-                           d.status AS status, d.ip AS ip, d.location AS location,
-                           collect(DISTINCT n.id) AS neighbors
-                """, ids=device_ids)
-            else:
-                result = session.run("""
-                    MATCH (d:Device)
-                    OPTIONAL MATCH (d)-[:CONNECTED_TO]->(n:Device)
-                    RETURN d.id AS id, d.name AS name, d.type AS type,
-                           d.status AS status, d.ip AS ip, d.location AS location,
-                           collect(DISTINCT n.id) AS neighbors
-                """)
-            nodes = []
-            for row in result:
-                nodes.append(TopologyNode(
-                    id        = row["id"],
-                    name      = row["name"],
-                    type      = row["type"],
-                    status    = row["status"],
-                    ip        = row["ip"] or "",
-                    location  = row["location"] or "",
-                    neighbors = [n for n in row["neighbors"] if n],
-                ))
-            return nodes
-
-    def get_neighbours(self, device_id: str) -> list[str]:
-        """Return IDs of all direct neighbours of a device."""
-        with self._driver.session() as session:
-            result = session.run("""
-                MATCH (d:Device {id: $id})-[:CONNECTED_TO]->(n:Device)
-                RETURN n.id AS neighbour_id
-            """, id=device_id)
-            return [row["neighbour_id"] for row in result]
-
-    def get_path(self, src_id: str, dst_id: str) -> list[str]:
-        """Return shortest path (device IDs) between two devices."""
-        with self._driver.session() as session:
-            result = session.run("""
-                MATCH p = shortestPath(
-                    (a:Device {id: $src})-[:CONNECTED_TO*]-(b:Device {id: $dst})
-                )
-                RETURN [node IN nodes(p) | node.id] AS path
-            """, src=src_id, dst=dst_id)
-            row = result.single()
-            return row["path"] if row else []
-
-    def get_blast_radius(self, device_id: str) -> list[str]:
-        """
-        Return all devices reachable ONLY through this device.
-        Used to assess impact of restarting/shutting down a device.
-        """
-        with self._driver.session() as session:
-            result = session.run("""
-                MATCH (d:Device {id: $id})-[:CONNECTED_TO*1..5]->(downstream:Device)
-                WHERE downstream.id <> $id
-                RETURN DISTINCT downstream.id AS affected_id
-            """, id=device_id)
-            return [row["affected_id"] for row in result]
-
-
-# ---------------------------------------------------------------------------
-# ChromaDB client
-# ---------------------------------------------------------------------------
-
-class ChromaContextClient:
-    def __init__(self):
-        import chromadb
-        from chromadb.utils import embedding_functions
-        self._client = chromadb.PersistentClient(path=CHROMA_PATH)
-        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
-        )
-        self._collection = self._client.get_or_create_collection(
-            name=CHROMA_COLLECTION,
-            embedding_function=ef,
-            metadata={"hnsw:space": "cosine"},
-        )
-        logger.info(f"✅ ChromaDB client connected ({self._collection.count()} docs)")
-
-    def search(self, query: str, top_k: int = 3, category: Optional[str] = None) -> list[SemanticDoc]:
-        """
-        Semantic search over the knowledge base.
-        Optionally filter by category: runbook, config, incident, policy, documentation
-        """
-        where = {"category": category} if category else None
+    def get_topology(self, node_ids: Optional[list] = None) -> list[TopologyNode]:
+        """Fetch real topology from Neo4j including neighbor relationships."""
+        if node_ids and len(node_ids) > 0:
+            ids_str = ", ".join(f'"{d}"' for d in node_ids)
+            cypher = f"MATCH (n:NetworkNode) WHERE n.name IN [{ids_str}] OPTIONAL MATCH (n)-[:CONNECTED_TO]-(neighbor:NetworkNode) WITH n, collect(DISTINCT neighbor.name) AS neighbor_names RETURN n.name AS node_id, n.name AS name, n.type AS type, n.status AS status, n.ip_addresses AS ip_addresses, n.cpu AS cpu, n.memory AS memory, neighbor_names AS neighbors"
+        else:
+            cypher = "MATCH (n:NetworkNode) OPTIONAL MATCH (n)-[:CONNECTED_TO]-(neighbor:NetworkNode) WITH n, collect(DISTINCT neighbor.name) AS neighbor_names RETURN n.name AS node_id, n.name AS name, n.type AS type, n.status AS status, n.ip_addresses AS ip_addresses, n.cpu AS cpu, n.memory AS memory, neighbor_names AS neighbors"
+        
         try:
-            n = max(1, min(top_k, self._collection.count()))
-            results = self._collection.query(
-                query_texts=[query],
-                n_results=n,
-                where=where,
-            )
+            raw = self.run_query(cypher)
+            print(f"📄 RAW RESPONSE:\n{raw}", file=sys.stderr)
+            rows = self._parse_table(raw)
+            print(f"📊 PARSED ROWS: {rows}", file=sys.stderr)
         except Exception as e:
-            logger.error(f"ChromaDB query failed: {e}")
+            print(f"❌ get_topology failed: {e}", file=sys.stderr)
             return []
 
+        nodes = []
+        for row in rows:
+            node_id = row.get('node_id') or row.get('col0')
+            name = row.get('name') or row.get('col1')
+            type_ = row.get('type') or row.get('col2')
+            status = row.get('status') or row.get('col3')
+            ip_addresses = row.get('ip_addresses') or row.get('col4')
+            cpu = row.get('cpu') or row.get('col5')
+            memory = row.get('memory') or row.get('col6')
+            neighbors = row.get('neighbors') or row.get('col7')
+            
+            node_id = str(node_id) if node_id is not None else ""
+            name = str(name) if name is not None else ""
+            type_ = str(type_) if type_ is not None else "unknown"
+            status = str(status) if status is not None else "unknown"
+            
+            first_ip = ""
+            if isinstance(ip_addresses, list) and ip_addresses:
+                first_ip = ip_addresses[0]
+            elif isinstance(ip_addresses, str):
+                first_ip = ip_addresses
+                
+            neighbors_list = neighbors if isinstance(neighbors, list) else []
+            
+            print(f"📍 {name}: neighbors = {neighbors_list}", file=sys.stderr)
+            
+            nodes.append(TopologyNode(
+                id=node_id,
+                name=name,
+                type=type_,
+                status=status,
+                ip=first_ip,
+                location="",
+                neighbors=[str(n) for n in neighbors_list if n],
+                cpu=cpu,
+                memory=memory,
+            ))
+        return nodes
+
+        def get_neighbours(self, node_id: str) -> list[str]:
+            cypher = f"MATCH (n:NetworkNode {{node_id: \"{node_id}\"}})-[:CONNECTED_TO]->(neighbor:NetworkNode) RETURN neighbor.node_id AS neighbor_id"
+            try:
+                raw = self.run_query(cypher)
+                rows = self._parse_table(raw)
+                return [str(r.get('col0')) for r in rows if r.get('col0')]
+            except Exception as e:
+                print(f"❌ get_neighbours failed: {e}", file=sys.stderr)
+                return []
+
+        def get_blast_radius(self, node_id: str) -> list[str]:
+            cypher = f"MATCH (n:NetworkNode {{node_id: \"{node_id}\"}})-[:CONNECTED_TO*1..5]->(downstream:NetworkNode) WHERE downstream.node_id <> \"{node_id}\" RETURN DISTINCT downstream.node_id AS affected_id"
+            try:
+                raw = self.run_query(cypher)
+                rows = self._parse_table(raw)
+                return [str(r.get('col0')) for r in rows if r.get('col0')]
+            except Exception as e:
+                print(f"❌ get_blast_radius failed: {e}", file=sys.stderr)
+                return []
+
+
+# ---------------------------------------------------------------------------
+# ChromaDB Client (optional)
+# ---------------------------------------------------------------------------
+class ChromaContextClient:
+    def __init__(self):
+        try:
+            import chromadb
+            from chromadb.utils import embedding_functions
+            self._client = chromadb.PersistentClient(path=CHROMA_PATH)
+            ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+            self._collection = self._client.get_or_create_collection(
+                name=CHROMA_COLLECTION,
+                embedding_function=ef,
+                metadata={"hnsw:space": "cosine"},
+            )
+            print(f"✅ ChromaDB connected ({self._collection.count()} docs)", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ ChromaDB unavailable: {e}", file=sys.stderr)
+            self._collection = None
+
+    def search(self, query: str, top_k: int = 3) -> list[SemanticDoc]:
+        if not self._collection:
+            return []
+        try:
+            n = max(1, min(top_k, self._collection.count()))
+            results = self._collection.query(query_texts=[query], n_results=n)
+        except Exception as e:
+            print(f"❌ ChromaDB search failed: {e}", file=sys.stderr)
+            return []
         docs = []
         for i, doc_text in enumerate(results["documents"][0]):
-            meta  = results["metadatas"][0][i]
-            dist  = results["distances"][0][i]   # cosine distance: 0=identical, 2=opposite
-            score = round(1 - dist / 2, 3)       # convert to 0-1 similarity
+            meta = results["metadatas"][0][i]
+            dist = results["distances"][0][i]
+            score = round(1 - dist / 2, 3)
             docs.append(SemanticDoc(
-                id              = results["ids"][0][i],
-                title           = meta.get("title", "Unknown"),
-                content         = doc_text,
-                relevance_score = score,
-                category        = meta.get("category", ""),
+                id=results["ids"][0][i],
+                title=meta.get("title", "Unknown"),
+                content=doc_text,
+                relevance_score=score,
+                category=meta.get("category", ""),
             ))
         return docs
 
 
 # ---------------------------------------------------------------------------
-# Stub fallbacks (used when MODE=stub or DB connections fail)
+# Context Builder
 # ---------------------------------------------------------------------------
-
-def _stub_topology(device_id: Optional[str] = None) -> list[TopologyNode]:
-    nodes = [
-        TopologyNode("router-1", "router",   "Core Router",         "up",       "10.0.0.1",   "core",  ["switch-1","switch-2","fw-1"]),
-        TopologyNode("switch-1", "switch",   "Access Switch 1",     "up",       "10.0.1.1",   "core",  ["router-1","server-1","server-2"]),
-        TopologyNode("switch-2", "switch",   "Distribution Switch", "degraded", "10.0.1.2",   "core",  ["router-1","server-3"]),
-        TopologyNode("server-1", "server",   "Web Server",          "up",       "10.0.2.1",   "dmz",   ["switch-1"]),
-        TopologyNode("server-2", "server",   "Database Server",     "up",       "10.0.2.2",   "dmz",   ["switch-1"]),
-        TopologyNode("server-3", "server",   "Application Server",  "down",     "10.0.2.3",   "dmz",   ["switch-2"]),
-        TopologyNode("fw-1",     "firewall", "Edge Firewall",       "up",       "10.0.0.254", "edge",  ["router-1"]),
-    ]
-    if device_id:
-        return [n for n in nodes if n.id == device_id]
-    return nodes
-
-def _stub_telemetry(device_ids: Optional[list] = None) -> list[TelemetryData]:
-    from datetime import datetime
-    profiles = {
-        "router-1": [("cpu_usage",45.6,"%"),("memory_usage",58.2,"%"),("latency_ms",12.5,"ms"),("packet_loss",0.05,"%")],
-        "switch-1": [("cpu_usage",18.2,"%"),("memory_usage",28.4,"%"),("latency_ms",3.1,"ms"), ("packet_loss",0.02,"%")],
-        "switch-2": [("cpu_usage",52.1,"%"),("memory_usage",61.3,"%"),("latency_ms",6.2,"ms"), ("packet_loss",2.3,"%")],
-        "server-1": [("cpu_usage",32.4,"%"),("memory_usage",55.8,"%"),("latency_ms",2.4,"ms"), ("packet_loss",0.01,"%")],
-        "server-2": [("cpu_usage",41.7,"%"),("memory_usage",67.2,"%"),("latency_ms",2.1,"ms"), ("packet_loss",0.01,"%")],
-        "server-3": [("cpu_usage",98.5,"%"),("memory_usage",95.2,"%"),("latency_ms",0.0,"ms"), ("packet_loss",0.0,"%")],
-        "fw-1":     [("cpu_usage",22.3,"%"),("memory_usage",38.1,"%"),("latency_ms",1.8,"ms"), ("packet_loss",0.01,"%")],
-    }
-    results = []
-    now = datetime.now()
-    for did, metrics in profiles.items():
-        if device_ids and did not in device_ids:
-            continue
-        for metric, value, unit in metrics:
-            results.append(TelemetryData(did, metric, value, unit, now))
-    return results
-
-def _stub_docs(query: str) -> list[SemanticDoc]:
-    return [
-        SemanticDoc("doc-1","Network Troubleshooting Guide",
-            "When a server shows degraded status, check CPU and memory usage first.",0.9,"runbook"),
-        SemanticDoc("doc-2","Switch Troubleshooting",
-            "Switch degradation often indicates spanning tree issues or port flapping.",0.8,"runbook"),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Main ContextBuilder
-# ---------------------------------------------------------------------------
-
 class ContextBuilder:
     def __init__(self):
         self._mode = MODE
-        self._influx  = None
-        self._neo4j   = None
-        self._chroma  = None
-
+        self._neo4j = None
+        self._chroma = None
+        print(f"🔧 Initializing ContextBuilder with MODE={self._mode}", file=sys.stderr)
         if self._mode == "live":
             self._init_live_clients()
         else:
-            logger.info("🔧 ContextBuilder running in STUB mode")
+            print("🔧 ContextBuilder running in STUB mode", file=sys.stderr)
 
     def _init_live_clients(self):
-        """
-        Try to connect to all three databases.
-        Fall back to stub for any that fail — so a missing DB
-        doesn't take down the whole service.
-        """
         try:
-            self._influx = InfluxDBContextClient()
+            self._neo4j = Neo4jBridgeClient()
         except Exception as e:
-            logger.warning(f"⚠️  InfluxDB unavailable ({e}) — using stub telemetry")
-
-        try:
-            self._neo4j = Neo4jContextClient()
-        except Exception as e:
-            logger.warning(f"⚠️  Neo4j unavailable ({e}) — using stub topology")
-
-        try:
-            self._chroma = ChromaContextClient()
-        except Exception as e:
-            logger.warning(f"⚠️  ChromaDB unavailable ({e}) — using stub docs")
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+            print(f"❌ FATAL: Neo4j bridge unavailable: {e}", file=sys.stderr)
+            raise RuntimeError("Neo4j is required for live mode. Set CONTEXT_BUILDER_MODE=stub if Neo4j is unavailable.")
+        self._chroma = ChromaContextClient()
 
     def get_topology(self, device_ids: Optional[list] = None) -> list[TopologyNode]:
-        if self._neo4j:
-            try:
-                return self._neo4j.get_topology(device_ids)
-            except Exception as e:
-                logger.error(f"Neo4j topology query failed: {e}")
-        return _stub_topology(device_ids[0] if device_ids and len(device_ids)==1 else None)
+        if not self._neo4j:
+            return []
+        return self._neo4j.get_topology(device_ids)
 
-    def get_telemetry(self, device_ids: Optional[list] = None,
-                      window_minutes: int = 5) -> list[TelemetryData]:
-        if self._influx:
-            try:
-                return self._influx.get_recent_metrics(
-                    device_ids=device_ids,
-                    window_minutes=window_minutes,
-                )
-            except Exception as e:
-                logger.error(f"InfluxDB telemetry query failed: {e}")
-        return _stub_telemetry(device_ids)
+    def get_telemetry(self, device_names: Optional[list] = None) -> list[TelemetryData]:
+        if not self._neo4j:
+            return []
+        return self._neo4j.get_telemetry(device_names)
 
     def get_semantic_context(self, query: str, top_k: int = 3) -> list[SemanticDoc]:
         if self._chroma:
-            try:
-                return self._chroma.search(query, top_k=top_k)
-            except Exception as e:
-                logger.error(f"ChromaDB search failed: {e}")
-        return _stub_docs(query)
+            return self._chroma.search(query, top_k=top_k)
+        return []
 
     def get_blast_radius(self, device_id: str) -> list[str]:
-        """Return affected devices if this device is restarted/shut down."""
         if self._neo4j:
-            try:
-                return self._neo4j.get_blast_radius(device_id)
-            except Exception as e:
-                logger.error(f"Neo4j blast radius query failed: {e}")
+            return self._neo4j.get_blast_radius(device_id)
         return []
 
     def build_context(self, query: str) -> ContextBundle:
-        logger.info(f"🔍 Building context for: {query[:60]}...")
+        print(f"\n🔍 Building context for: {query[:60]}...", file=sys.stderr)
+        matches = DEVICE_ID_RE.findall(query.lower())
+        query_device_names = [f"{name}{num}" for name, num in matches]
+        print(f"📝 Extracted device names: {query_device_names}", file=sys.stderr)
 
-        # Extract specific device IDs from query (e.g. "router-1", "switch-2")
-        device_ids = list(set(DEVICE_ID_RE.findall(query)))
+        all_topology = self.get_topology()
+        print(f"📊 Retrieved {len(all_topology)} nodes from Neo4j", file=sys.stderr)
 
-        topology  = self.get_topology(device_ids if device_ids else None)
-        telemetry = self.get_telemetry(device_ids if device_ids else None)
-        docs      = self.get_semantic_context(query)
+        if query_device_names:
+            relevant_nodes = [n for n in all_topology if n.name.lower() in query_device_names]
+            if not relevant_nodes:
+                for name_part in set([m[0] for m in matches]):
+                    relevant_nodes = [n for n in all_topology if name_part in n.name.lower()]
+                    if relevant_nodes:
+                        break
+            topology = relevant_nodes if relevant_nodes else all_topology
+        else:
+            topology = all_topology
 
-        # For action queries targeting a specific device, also fetch blast radius
+        device_names = [node.name for node in topology if node.name]
+        print(f"📡 Requesting telemetry for: {device_names}", file=sys.stderr)
+        telemetry = self.get_telemetry(device_names if device_names else None)
+        print(f"📈 Retrieved {len(telemetry)} telemetry readings", file=sys.stderr)
+
+        docs = self.get_semantic_context(query)
+
         blast_radius = []
-        if device_ids:
-            for did in device_ids:
-                blast_radius.extend(self.get_blast_radius(did))
+        for node in topology:
+            if node.name and node.name.lower() in query.lower():
+                blast_radius.extend(self.get_blast_radius(node.id))
+        blast_radius = list(set(blast_radius))
 
-        bundle = ContextBundle(
-            query    = query,
-            topology = topology,
-            telemetry= telemetry,
-            docs     = docs,
-        )
-        # Attach blast radius as an attribute (used by summarize_context)
-        bundle.blast_radius = list(set(blast_radius))
-
-        logger.info(
-            f"✅ Context: {len(topology)} nodes, {len(telemetry)} metrics, "
-            f"{len(docs)} docs, blast_radius={bundle.blast_radius}"
-        )
+        bundle = ContextBundle(query, topology, telemetry, docs)
+        bundle.blast_radius = blast_radius
+        print(f"✅ Context built: {len(topology)} nodes, {len(telemetry)} telemetry, {len(docs)} docs, blast_radius={blast_radius}\n", file=sys.stderr)
         return bundle
 
     def summarize_context(self, bundle: ContextBundle) -> str:
-        """
-        Convert ContextBundle into structured text for the prompt.
-        Enforces MAX_CONTEXT_CHARS budget.
-        """
         lines = []
-        status_icons = {"up": "✅", "degraded": "⚠️", "down": "❌", "unknown": "❓"}
-
-        # ── Topology
+        status_icons = {"active": "✅", "up": "✅", "degraded": "⚠️", "down": "❌", "unknown": "❓"}
         lines.append("=== NETWORK TOPOLOGY ===")
-        for node in bundle.topology:
-            icon = status_icons.get(node.status, "❓")
-            lines.append(
-                f"{icon} {node.name} [id: {node.id}] ({node.type}) "
-                f"IP:{node.ip} — {node.status}"
-            )
-            if node.neighbors:
-                lines.append(f"   Connected to: {', '.join(node.neighbors[:4])}")
-
-        # ── Blast radius (for action queries)
-        if hasattr(bundle, "blast_radius") and bundle.blast_radius:
-            lines.append(f"\n⚠️  BLAST RADIUS: Restarting/modifying this device will affect: "
-                         f"{', '.join(bundle.blast_radius)}")
-
-        # ── Telemetry
+        if not bundle.topology:
+            lines.append("No topology data available.")
+        else:
+            for node in bundle.topology:
+                icon = status_icons.get(node.status, "❓")
+                lines.append(f"{icon} {node.name} [id: {node.id}] ({node.type}) IP:{node.ip if node.ip else 'N/A'} — {node.status}")
+                if node.neighbors:
+                    lines.append(f"   Connected to: {', '.join(node.neighbors[:4])}")
+        if bundle.blast_radius:
+            lines.append(f"\n⚠️ BLAST RADIUS: Affected devices: {', '.join(bundle.blast_radius)}")
         if bundle.telemetry:
-            lines.append("\n=== CURRENT TELEMETRY (last 5 min) ===")
-            by_device: dict = {}
+            lines.append("\n=== TELEMETRY METRICS ===")
+            by_device = {}
             for t in bundle.telemetry:
                 by_device.setdefault(t.device_id, []).append(t)
-
-            # Prioritise devices with anomalous values
-            def _anomaly_score(metrics):
-                score = 0
-                for m in metrics:
-                    if m.metric == "cpu_usage"    and m.value > 80: score += 2
-                    if m.metric == "memory_usage" and m.value > 85: score += 2
-                    if m.metric == "packet_loss"  and m.value > 1:  score += 3
-                    if m.metric == "error_rate"   and m.value > 0.1:score += 1
-                return score
-
-            sorted_devices = sorted(by_device.items(),
-                                    key=lambda kv: _anomaly_score(kv[1]),
-                                    reverse=True)
-
-            for device, metrics in sorted_devices[:4]:  # max 4 devices
+            for device, metrics in by_device.items():
                 lines.append(f"\n{device}:")
-                # Sort metrics: anomalous first
-                for m in sorted(metrics, key=lambda x: x.value, reverse=True)[:5]:
+                for m in metrics:
                     flag = ""
-                    if m.metric == "cpu_usage"    and m.value > 80: flag = " ⚠️ HIGH"
-                    if m.metric == "memory_usage" and m.value > 85: flag = " ⚠️ HIGH"
-                    if m.metric == "packet_loss"  and m.value > 1:  flag = " ⚠️ ELEVATED"
+                    if m.metric == "cpu_usage" and m.value > 80:
+                        flag = " ⚠️ HIGH"
+                    elif m.metric == "memory_usage" and m.value > 85:
+                        flag = " ⚠️ HIGH"
+                    elif m.metric == "packet_loss" and m.value > 1:
+                        flag = " ⚠️ ELEVATED"
                     lines.append(f"   • {m.metric}: {m.value:.1f} {m.unit}{flag}")
-
-        # ── Documentation
+        else:
+            lines.append("\n=== TELEMETRY ===\n⚠️ No telemetry data available for these devices (metrics not populated in Neo4j)")
         if bundle.docs:
             lines.append("\n=== RELEVANT KNOWLEDGE ===")
             for doc in bundle.docs[:2]:
                 lines.append(f"\n[{doc.category.upper()}] {doc.title}")
-                # Truncate to 300 chars per doc
                 content = doc.content[:300] + "..." if len(doc.content) > 300 else doc.content
                 lines.append(f"   {content}")
-
         result = "\n".join(lines)
-
-        # Hard truncation at budget
         if len(result) > MAX_CONTEXT_CHARS:
             result = result[:MAX_CONTEXT_CHARS] + "\n[context truncated]"
-
         return result
 
 
