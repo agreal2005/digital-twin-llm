@@ -386,25 +386,25 @@ class Neo4jBridgeClient:
             ))
         return nodes
 
-        def get_neighbours(self, node_id: str) -> list[str]:
-            cypher = f"MATCH (n:NetworkNode {{node_id: \"{node_id}\"}})-[:CONNECTED_TO]->(neighbor:NetworkNode) RETURN neighbor.node_id AS neighbor_id"
-            try:
-                raw = self.run_query(cypher)
-                rows = self._parse_table(raw)
-                return [str(r.get('col0')) for r in rows if r.get('col0')]
-            except Exception as e:
-                print(f"❌ get_neighbours failed: {e}", file=sys.stderr)
-                return []
+    def get_neighbours(self, node_id: str) -> list[str]:
+        cypher = f"MATCH (n:NetworkNode {{node_id: \"{node_id}\"}})-[:CONNECTED_TO]->(neighbor:NetworkNode) RETURN neighbor.node_id AS neighbor_id"
+        try:
+            raw = self.run_query(cypher)
+            rows = self._parse_table(raw)
+            return [str(r.get('col0')) for r in rows if r.get('col0')]
+        except Exception as e:
+            print(f"❌ get_neighbours failed: {e}", file=sys.stderr)
+            return []
 
-        def get_blast_radius(self, node_id: str) -> list[str]:
-            cypher = f"MATCH (n:NetworkNode {{node_id: \"{node_id}\"}})-[:CONNECTED_TO*1..5]->(downstream:NetworkNode) WHERE downstream.node_id <> \"{node_id}\" RETURN DISTINCT downstream.node_id AS affected_id"
-            try:
-                raw = self.run_query(cypher)
-                rows = self._parse_table(raw)
-                return [str(r.get('col0')) for r in rows if r.get('col0')]
-            except Exception as e:
-                print(f"❌ get_blast_radius failed: {e}", file=sys.stderr)
-                return []
+    def get_blast_radius(self, node_id: str) -> list[str]:
+        cypher = f"MATCH (n:NetworkNode {{node_id: \"{node_id}\"}})-[:CONNECTED_TO*1..5]->(downstream:NetworkNode) WHERE downstream.node_id <> \"{node_id}\" RETURN DISTINCT downstream.node_id AS affected_id"
+        try:
+            raw = self.run_query(cypher)
+            rows = self._parse_table(raw)
+            return [str(r.get('col0')) for r in rows if r.get('col0')]
+        except Exception as e:
+            print(f"❌ get_blast_radius failed: {e}", file=sys.stderr)
+            return []
 
 
 # ---------------------------------------------------------------------------
