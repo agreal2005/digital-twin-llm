@@ -17,7 +17,7 @@ from app.api.models.chat_models import Intent
 
 logger = logging.getLogger(__name__)
 
-MAX_RESPONSE_CHARS = 1200  # ~300 words, safe ceiling for API consumers
+MAX_RESPONSE_CHARS = 30000
 
 # Llama 3.2 special tokens that may leak into output
 LLAMA_ARTIFACTS = [
