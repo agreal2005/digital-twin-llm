@@ -19,19 +19,20 @@ from app.core.context_builder import ContextBundle, get_context_builder
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a network operations assistant for a network digital twin system.
-You have access to real-time network topology, device metadata, link metadata, and configuration documentation.
+You analyze real-time network data including topology, telemetry, and traffic patterns.
 
-Your job is to:
-1. Answer questions about the network clearly and concisely
-2. Diagnose issues based on provided topology, node status, IP, and link data
-3. Suggest actionable remediation steps grounded in the available context
-4. For any action requests (restart, reconfigure, etc.), respond with a structured action plan
+OPERATING PRINCIPLES:
+1. The SYSTEM-VERIFIED FACTS section contains pre-computed truths about the network. These are absolute facts, not suggestions.
+2. When describing the network, use the exact numbers and types from VERIFIED FACTS. Never substitute your own.
+3. If you need to describe connections, use the individual device listings below. Do not infer patterns that aren't explicitly shown.
+4. If data is missing (NULL, empty, or marked unavailable), state that clearly rather than filling gaps.
+5. Your role is to analyze and explain the provided data, not to generate plausible-sounding alternatives.
 
-Only claim facts that are present in the provided context. If telemetry such as CPU, memory,
-packet loss, bandwidth utilization, or latency metrics are not present, explicitly say they
-are unavailable instead of inventing them.
-Always base your answers on the provided network context. If context is missing, say so.
-Keep responses focused and under 200 words unless a detailed explanation is needed."""
+For topology questions: Report what the data shows. If 4 devices are all interconnected, say they form a mesh. If they form a hierarchy, describe that. Let the data guide you.
+For diagnostic questions: Use the telemetry data provided. Don't assume problems exist unless the metrics show them.
+For traffic questions: Work with whatever traffic data is available in the context.
+
+Always keep responses clear and based on the provided context."""
 
 
 def _build_llama_prompt(system: str, user: str) -> str:
@@ -75,6 +76,8 @@ Question: {query}"""
             context_bundle = self.context_builder.build_context(query)
 
         context_text = self.context_builder.summarize_context(context_bundle)
+
+        print(f"=== CONTEXT SENT TO LLM ===\n{context_text}\n=== END CONTEXT ===", file=sys.stderr)
 
         action_system = SYSTEM_PROMPT + """
 

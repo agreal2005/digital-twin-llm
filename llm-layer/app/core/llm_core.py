@@ -39,7 +39,7 @@ class LLMCore:
         self, 
         prompt: str, 
         max_tokens: int = 500,
-        temperature: float = 0.7,
+        temperature: float = 0.0,  # Changed from 0.7 to 0.0
         stop: Optional[List[str]] = None,
         echo: bool = False
     ) -> Dict[str, Any]:
