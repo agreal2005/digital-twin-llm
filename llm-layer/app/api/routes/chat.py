@@ -77,8 +77,8 @@ async def chat(request: ChatRequest):
         llm    = get_llm()
         result = llm.generate(
             prompt=prompt,
-            max_tokens=request.max_tokens or 500,
-            temperature=request.temperature or 0.7,
+            max_tokens=request.max_tokens or 0,
+            temperature=request.temperature or 0.0,
             stop=["<|eot_id|>", "<|start_header_id|>"],
         )
 
