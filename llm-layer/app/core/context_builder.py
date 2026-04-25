@@ -24,7 +24,7 @@ NEO4J_BRIDGE_TIMEOUT = int(os.getenv("NEO4J_BRIDGE_TIMEOUT", "15"))
 MODE = os.getenv("CONTEXT_BUILDER_MODE", "live").lower()
 print(f"🔧 CONTEXT_BUILDER_MODE = {MODE}", file=sys.stderr)
 
-MAX_CONTEXT_CHARS = 7200
+MAX_CONTEXT_CHARS = 4000
 DEVICE_ID_RE = re.compile(r'\b([a-zA-Z]+)[\s-]?(\d+)\b', re.IGNORECASE)
 IP_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
 

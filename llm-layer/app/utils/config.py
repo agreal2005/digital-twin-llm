@@ -8,7 +8,7 @@ load_dotenv()
 class Config:
     # Model settings
     MODEL_PATH: str = os.getenv("MODEL_PATH", "/home/agreal2016/btp/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf")
-    MODEL_N_CTX: int = int(os.getenv("MODEL_N_CTX", "4096"))
+    MODEL_N_CTX: int = int(os.getenv("MODEL_N_CTX", "16384"))
     MODEL_N_THREADS: int = int(os.getenv("MODEL_N_THREADS", "4"))
     
     # API settings
