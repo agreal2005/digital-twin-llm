@@ -58,11 +58,11 @@ class ShortestPath:
         self.from_device = from_device
         self.to_device = to_device
         self.hops_count = hops_count
-        self.path_devices = path_devices  # ordered list of device names
-        self.hops = hops or []  # list of PathHop objects
+        self.path_devices = path_devices
+        self.hops = hops or []
 
 class TopologyNode:
-    def __init__(self, id, type, name, status, ip="", location="", ns3_ips=None, neighbors=None, links=None, cpu=None, memory=None):
+    def __init__(self, id, type, name, status, ip="", location="", ns3_ips=None, neighbors=None, links=None):
         self.id = id
         self.type = type
         self.name = name
@@ -72,10 +72,9 @@ class TopologyNode:
         self.ns3_ips = ns3_ips or []
         self.neighbors = neighbors or []
         self.links = links or []
-        self.cpu = cpu
-        self.memory = memory
 
 class TelemetryData:
+    """Placeholder for future node-level metrics (cpu, memory, packet_loss, etc.)."""
     def __init__(self, device_id, metric, value, unit, timestamp=None):
         self.device_id = device_id
         self.metric = metric
@@ -84,10 +83,9 @@ class TelemetryData:
         self.timestamp = timestamp or datetime.now()
 
 class ContextBundle:
-    def __init__(self, query, topology=None, telemetry=None, links=None, shortest_path=None):
+    def __init__(self, query, topology=None, links=None, shortest_path=None):
         self.query = query
         self.topology = topology or []
-        self.telemetry = telemetry or []
         self.links = links or []
         self.shortest_path = shortest_path
         self.blast_radius = []
@@ -388,8 +386,6 @@ class Neo4jBridgeClient:
     # ------------------------------------------------------------------
 
     def _resolve_device_name(self, identifier: str) -> Optional[str]:
-        """Resolve an IP or name to a device name. Returns None if not found."""
-        # Try exact name match first
         cypher = f"MATCH (n:NetworkNode) WHERE n.name = \"{identifier}\" OR n.ip = \"{identifier}\" OR \"{identifier}\" IN n.ns3_ips RETURN n.name AS name LIMIT 1"
         try:
             raw = self.run_query(cypher)
@@ -401,10 +397,8 @@ class Neo4jBridgeClient:
         return None
 
     def get_shortest_path(self, from_id: str, to_id: str) -> Optional[ShortestPath]:
-        """Find shortest path (by hop count, like RIP) between two devices."""
         from_name = self._resolve_device_name(from_id)
         to_name = self._resolve_device_name(to_id)
-
         if not from_name:
             print(f"❌ Could not resolve source: {from_id}", file=sys.stderr)
             return None
@@ -418,67 +412,52 @@ class Neo4jBridgeClient:
             f"path = shortestPath((start)-[:CONNECTED_TO*]-(end)) "
             f"RETURN nodes(path) AS node_list, relationships(path) AS rel_list, length(path) AS hops"
         )
-
         try:
             raw = self.run_query(cypher)
             rows = self._parse_table(raw)
         except Exception as e:
             print(f"❌ get_shortest_path failed: {e}", file=sys.stderr)
             return None
-
         if not rows:
             print(f"⚠️ No path found between {from_name} and {to_name}", file=sys.stderr)
             return None
 
         row = rows[0]
-        hops_count = row.get('hops') or row.get('col2') or 0
-        hops_count = int(hops_count) if hops_count is not None else 0
-
-        # Parse node list - handled by _parse_cell which may return parsed node objects
+        hops_count = int(row.get('hops') or row.get('col2') or 0)
         node_list_raw = row.get('node_list') or row.get('col0') or []
         rel_list_raw = row.get('rel_list') or row.get('col1') or []
 
-        # Build ordered device name list
         path_devices = []
         if isinstance(node_list_raw, list):
             for node_item in node_list_raw:
                 if isinstance(node_item, dict):
                     path_devices.append(str(node_item.get('name', '')))
                 elif isinstance(node_item, str):
-                    # Try to extract name from string representation
                     name_match = re.search(r'name:\s*"([^"]+)"', node_item)
                     if name_match:
                         path_devices.append(name_match.group(1))
                     else:
                         path_devices.append(node_item)
 
-        # Build hop details
         path_hops = []
         if isinstance(rel_list_raw, list) and len(rel_list_raw) > 0:
-            # rel_list_raw might be a list containing a single list of relationships
             flat_rels = rel_list_raw
             if len(rel_list_raw) == 1 and isinstance(rel_list_raw[0], list):
                 flat_rels = rel_list_raw[0]
-
             for i, rel_item in enumerate(flat_rels):
                 if isinstance(rel_item, dict):
-                    from_ip = str(rel_item.get('from_interface_ip', ''))
-                    to_ip = str(rel_item.get('to_interface_ip', ''))
-                    delay = str(rel_item.get('delay', 'unknown'))
-                    data_rate = str(rel_item.get('data_rate', 'unknown'))
                     from_dev = path_devices[i] if i < len(path_devices) else '?'
                     to_dev = path_devices[i+1] if i+1 < len(path_devices) else '?'
                     path_hops.append(PathHop(
                         hop_num=i+1,
                         from_device=from_dev,
                         to_device=to_dev,
-                        from_ip=from_ip,
-                        to_ip=to_ip,
-                        delay=delay,
-                        data_rate=data_rate,
+                        from_ip=str(rel_item.get('from_interface_ip', '')),
+                        to_ip=str(rel_item.get('to_interface_ip', '')),
+                        delay=str(rel_item.get('delay', 'unknown')),
+                        data_rate=str(rel_item.get('data_rate', 'unknown')),
                     ))
                 elif isinstance(rel_item, str):
-                    # Parse from string representation
                     from_ip_match = re.search(r'from_interface_ip:\s*"([^"]+)"', rel_item)
                     to_ip_match = re.search(r'to_interface_ip:\s*"([^"]+)"', rel_item)
                     delay_match = re.search(r'delay:\s*"([^"]+)"', rel_item)
@@ -519,7 +498,6 @@ class Neo4jBridgeClient:
             f"collect(DISTINCT {{id: r.id, from_ip: r.from_interface_ip, to_ip: r.to_interface_ip, "
             f"delay: r.delay, data_rate: r.data_rate, other_name: m.name}}) AS link_data"
         )
-
         try:
             raw = self.run_query(cypher)
             rows = self._parse_table(raw)
@@ -606,43 +584,6 @@ class Neo4jBridgeClient:
             ))
         return nodes
 
-    def get_telemetry(self, node_names: Optional[list] = None) -> list[TelemetryData]:
-        if node_names and len(node_names) > 0:
-            names_str = ", ".join(f'"{n}"' for n in node_names)
-            cypher = f"MATCH (n:NetworkNode) WHERE n.name IN [{names_str}] RETURN n.name AS device_id, n.cpu AS cpu, n.memory AS memory, n.packet_loss AS packet_loss, n.bandwidth AS bandwidth, n.latency AS latency"
-        else:
-            cypher = "MATCH (n:NetworkNode) RETURN n.name AS device_id, n.cpu AS cpu, n.memory AS memory, n.packet_loss AS packet_loss, n.bandwidth AS bandwidth, n.latency AS latency"
-        try:
-            raw = self.run_query(cypher)
-            rows = self._parse_table(raw)
-        except Exception as e:
-            print(f"❌ get_telemetry failed: {e}", file=sys.stderr)
-            return []
-        results = []
-        now = datetime.now()
-        for row in rows:
-            device_id = row.get('col0')
-            if not device_id:
-                continue
-            device_id = str(device_id)
-            metrics_map = [
-                (row.get('col1'), "cpu_usage", "%"),
-                (row.get('col2'), "memory_usage", "%"),
-                (row.get('col3'), "packet_loss", "%"),
-                (row.get('col4'), "bandwidth_mbps", "Mbps"),
-                (row.get('col5'), "latency_ms", "ms"),
-            ]
-            for value, metric_name, unit in metrics_map:
-                if value is not None and str(value).lower() not in ("null", "none", ""):
-                    try:
-                        results.append(TelemetryData(
-                            device_id=device_id, metric=metric_name,
-                            value=round(float(value), 2), unit=unit, timestamp=now
-                        ))
-                    except (ValueError, TypeError):
-                        pass
-        return results
-
     def get_neighbours(self, node_id: str) -> list[str]:
         cypher = f"MATCH (n:NetworkNode {{name: \"{node_id}\"}})-[:CONNECTED_TO]-(neighbor:NetworkNode) RETURN neighbor.name AS neighbor_name"
         try:
@@ -689,11 +630,6 @@ class ContextBuilder:
             return []
         return self._neo4j.get_topology(device_ids)
 
-    def get_telemetry(self, device_names: Optional[list] = None) -> list[TelemetryData]:
-        if not self._neo4j:
-            return []
-        return self._neo4j.get_telemetry(device_names)
-
     def get_blast_radius(self, device_id: str) -> list[str]:
         if self._neo4j:
             return self._neo4j.get_blast_radius(device_id)
@@ -705,7 +641,6 @@ class ContextBuilder:
         return None
 
     def _extract_path_endpoints(self, query: str) -> tuple[Optional[str], Optional[str]]:
-        """Extract 'from X to Y' pattern from query. Returns (from_id, to_id)."""
         path_patterns = [
             re.compile(r'(?:shortest\s+)?path\s+(?:from\s+)?(\S+)\s+to\s+(\S+)', re.IGNORECASE),
             re.compile(r'between\s+(\S+)\s+and\s+(\S+)', re.IGNORECASE),
@@ -715,7 +650,6 @@ class ContextBuilder:
             match = pattern.search(query)
             if match:
                 return match.group(1).strip('"\','), match.group(2).strip('"\',')
-        # Fallback: look for IPs or device names mentioned
         ips = IP_RE.findall(query)
         if len(ips) >= 2:
             return ips[0], ips[1]
@@ -752,18 +686,12 @@ class ContextBuilder:
                     seen_link_ids.add(link.link_id)
                     all_links.append(link)
 
-        device_names = [node.name for node in topology if node.name]
-        print(f"📡 Requesting telemetry for: {device_names}", file=sys.stderr)
-        telemetry = self.get_telemetry(device_names if device_names else None)
-        print(f"📈 Retrieved {len(telemetry)} telemetry readings", file=sys.stderr)
-
         blast_radius = []
         for node in topology:
             if node.name and node.name.lower() in query.lower():
                 blast_radius.extend(self.get_blast_radius(node.id))
         blast_radius = list(set(blast_radius))
 
-        # Shortest path detection
         shortest_path = None
         if any(kw in query.lower() for kw in ['shortest path', 'path from', 'path between', 'route from']):
             from_id, to_id = self._extract_path_endpoints(query)
@@ -773,9 +701,9 @@ class ContextBuilder:
                 if shortest_path:
                     print(f"✅ Path found: {shortest_path.hops_count} hops, {' → '.join(shortest_path.path_devices)}", file=sys.stderr)
 
-        bundle = ContextBundle(query, topology, telemetry, links=all_links, shortest_path=shortest_path)
+        bundle = ContextBundle(query, topology, links=all_links, shortest_path=shortest_path)
         bundle.blast_radius = blast_radius
-        print(f"✅ Context built: {len(topology)} nodes, {len(all_links)} links, {len(telemetry)} telemetry, blast_radius={blast_radius}, path={'yes' if shortest_path else 'no'}\n", file=sys.stderr)
+        print(f"✅ Context built: {len(topology)} nodes, {len(all_links)} links, blast_radius={blast_radius}, path={'yes' if shortest_path else 'no'}\n", file=sys.stderr)
         return bundle
 
     @staticmethod
@@ -854,11 +782,6 @@ class ContextBuilder:
             else:
                 lines.append("TOPOLOGY TYPE: Partial mesh")
 
-        if bundle.telemetry:
-            lines.append(f"TELEMETRY STATUS: {len(bundle.telemetry)} metrics across {len(set(t.device_id for t in bundle.telemetry))} devices")
-        else:
-            lines.append("TELEMETRY STATUS: No telemetry data available")
-
         if bundle.blast_radius:
             lines.append(f"BLAST RADIUS: {len(bundle.blast_radius)} devices - {', '.join(bundle.blast_radius)}")
 
@@ -905,19 +828,6 @@ class ContextBuilder:
                     lines.append(f"   Links ({len(node.links)}):")
                     for link in node.links:
                         lines.append(f"      → {link.to_device}: {link.from_ip}→{link.to_ip} | delay: {link.delay} | rate: {link.data_rate}")
-                device_metrics = [t for t in bundle.telemetry if t.device_id == node.name]
-                if device_metrics:
-                    metrics_str = []
-                    for m in device_metrics:
-                        flag = ""
-                        if m.metric == "cpu_usage" and m.value > 80:
-                            flag = " ⚠️"
-                        elif m.metric == "memory_usage" and m.value > 85:
-                            flag = " ⚠️"
-                        elif m.metric == "packet_loss" and m.value > 1:
-                            flag = " ⚠️"
-                        metrics_str.append(f"{m.metric}: {m.value}{m.unit}{flag}")
-                    lines.append(f"   Metrics: {', '.join(metrics_str)}")
 
         result = "\n".join(lines)
         if len(result) > MAX_CONTEXT_CHARS:
