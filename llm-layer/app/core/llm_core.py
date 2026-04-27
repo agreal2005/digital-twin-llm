@@ -38,7 +38,7 @@ class LLMCore:
     def generate(
         self, 
         prompt: str, 
-        max_tokens: int = 500,
+        max_tokens: int = 4096,
         temperature: float = 0.0,  # Changed from 0.7 to 0.0
         stop: Optional[List[str]] = None,
         echo: bool = False

@@ -24,7 +24,7 @@ NEO4J_BRIDGE_TIMEOUT = int(os.getenv("NEO4J_BRIDGE_TIMEOUT", "15"))
 MODE = os.getenv("CONTEXT_BUILDER_MODE", "live").lower()
 print(f"🔧 CONTEXT_BUILDER_MODE = {MODE}", file=sys.stderr)
 
-MAX_CONTEXT_CHARS = 4000
+MAX_CONTEXT_CHARS = 24000
 DEVICE_ID_RE = re.compile(r'\b([a-zA-Z]+)[\s-]?(\d+)\b', re.IGNORECASE)
 IP_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
 
@@ -751,7 +751,7 @@ class ContextBuilder:
             loc_summary = ", ".join(f"{count} in {loc}" for loc, count in sorted(location_counts.items()))
             lines.append(f"LOCATIONS: {loc_summary}")
 
-        lines.append(f"LINK COUNT: {len(bundle.links)} direct links")
+        lines.append(f"LINK COUNT: {len(bundle.links)} unique links")
         if bundle.links:
             delays = [self._parse_delay_ms(l.delay) for l in bundle.links]
             data_rates = [self._parse_data_rate_gbps(l.data_rate) for l in bundle.links]
@@ -808,7 +808,24 @@ class ContextBuilder:
         lines.append("")
 
         # ============================================================
-        # SECTION 2: DEVICE DETAILS
+        # SECTION 2: COMPLETE LINK LIST (pre-computed, deduplicated)
+        # ============================================================
+        lines.append("=== COMPLETE LINK LIST ===")
+        lines.append("(Every unique link exactly once. Use these exact values in your response.)")
+        lines.append(f"TOTAL UNIQUE LINKS: {len(bundle.links)}")
+        seen = set()
+        link_num = 1
+        for link in bundle.links:
+            pair = tuple(sorted([link.from_device, link.to_device]))
+            if pair not in seen:
+                seen.add(pair)
+                lines.append(f"  {link_num}. {link.from_device}↔{link.to_device}: {link.from_ip}→{link.to_ip} | delay: {link.delay} | rate: {link.data_rate}")
+                link_num += 1
+        lines.append(f"END OF LINK LIST ({len(seen)} links listed)")
+        lines.append("")
+
+        # ============================================================
+        # SECTION 3: DEVICE DETAILS
         # ============================================================
         lines.append("=== DEVICE DETAILS ===")
         if not bundle.topology:
@@ -825,9 +842,7 @@ class ContextBuilder:
                 else:
                     lines.append(f"   Neighbors: (none - isolated)")
                 if node.links:
-                    lines.append(f"   Links ({len(node.links)}):")
-                    for link in node.links:
-                        lines.append(f"      → {link.to_device}: {link.from_ip}→{link.to_ip} | delay: {link.delay} | rate: {link.data_rate}")
+                    lines.append(f"   Links: {len(node.links)} connections (see COMPLETE LINK LIST above for full details)")
 
         result = "\n".join(lines)
         if len(result) > MAX_CONTEXT_CHARS:
