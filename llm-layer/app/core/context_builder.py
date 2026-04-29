@@ -424,55 +424,54 @@ class Neo4jBridgeClient:
 
         row = rows[0]
         hops_count = int(row.get('hops') or row.get('col2') or 0)
-        node_list_raw = row.get('node_list') or row.get('col0') or []
-        rel_list_raw = row.get('rel_list') or row.get('col1') or []
+        
+        # Get raw values - they might be strings or already-parsed lists
+        node_list_raw = row.get('node_list') or row.get('col0') or ''
+        rel_list_raw = row.get('rel_list') or row.get('col1') or ''
 
+        # ============================================================
+        # Parse device names - use regex on the raw string directly
+        # ============================================================
         path_devices = []
-        if isinstance(node_list_raw, list):
-            for node_item in node_list_raw:
-                if isinstance(node_item, dict):
-                    path_devices.append(str(node_item.get('name', '')))
-                elif isinstance(node_item, str):
-                    name_match = re.search(r'name:\s*"([^"]+)"', node_item)
-                    if name_match:
-                        path_devices.append(name_match.group(1))
-                    else:
-                        path_devices.append(node_item)
+        raw_str = str(node_list_raw)
+        names = re.findall(r'name:\s*"([^"]+)"', raw_str)
+        if names:
+            path_devices = names
+        else:
+            # Fallback: try iterating if it's a list
+            if isinstance(node_list_raw, list):
+                for item in node_list_raw:
+                    if isinstance(item, dict):
+                        path_devices.append(str(item.get('name', '')))
+                    elif isinstance(item, str):
+                        m = re.search(r'name:\s*"([^"]+)"', item)
+                        if m:
+                            path_devices.append(m.group(1))
+
+        # ============================================================
+        # Parse relationships - extract all fields with regex
+        # ============================================================
+        raw_rel_str = str(rel_list_raw)
+        
+        # Extract all relationship attributes in order
+        from_ips = re.findall(r'from_interface_ip:\s*"([^"]+)"', raw_rel_str)
+        to_ips = re.findall(r'to_interface_ip:\s*"([^"]+)"', raw_rel_str)
+        delays = re.findall(r'delay:\s*"([^"]+)"', raw_rel_str)
+        data_rates = re.findall(r'data_rate:\s*"([^"]+)"', raw_rel_str)
 
         path_hops = []
-        if isinstance(rel_list_raw, list) and len(rel_list_raw) > 0:
-            flat_rels = rel_list_raw
-            if len(rel_list_raw) == 1 and isinstance(rel_list_raw[0], list):
-                flat_rels = rel_list_raw[0]
-            for i, rel_item in enumerate(flat_rels):
-                if isinstance(rel_item, dict):
-                    from_dev = path_devices[i] if i < len(path_devices) else '?'
-                    to_dev = path_devices[i+1] if i+1 < len(path_devices) else '?'
-                    path_hops.append(PathHop(
-                        hop_num=i+1,
-                        from_device=from_dev,
-                        to_device=to_dev,
-                        from_ip=str(rel_item.get('from_interface_ip', '')),
-                        to_ip=str(rel_item.get('to_interface_ip', '')),
-                        delay=str(rel_item.get('delay', 'unknown')),
-                        data_rate=str(rel_item.get('data_rate', 'unknown')),
-                    ))
-                elif isinstance(rel_item, str):
-                    from_ip_match = re.search(r'from_interface_ip:\s*"([^"]+)"', rel_item)
-                    to_ip_match = re.search(r'to_interface_ip:\s*"([^"]+)"', rel_item)
-                    delay_match = re.search(r'delay:\s*"([^"]+)"', rel_item)
-                    rate_match = re.search(r'data_rate:\s*"([^"]+)"', rel_item)
-                    from_dev = path_devices[i] if i < len(path_devices) else '?'
-                    to_dev = path_devices[i+1] if i+1 < len(path_devices) else '?'
-                    path_hops.append(PathHop(
-                        hop_num=i+1,
-                        from_device=from_dev,
-                        to_device=to_dev,
-                        from_ip=from_ip_match.group(1) if from_ip_match else '?',
-                        to_ip=to_ip_match.group(1) if to_ip_match else '?',
-                        delay=delay_match.group(1) if delay_match else 'unknown',
-                        data_rate=rate_match.group(1) if rate_match else 'unknown',
-                    ))
+        for i in range(len(from_ips)):
+            from_dev = path_devices[i] if i < len(path_devices) else '?'
+            to_dev = path_devices[i+1] if i+1 < len(path_devices) else '?'
+            path_hops.append(PathHop(
+                hop_num=i+1,
+                from_device=from_dev,
+                to_device=to_dev,
+                from_ip=from_ips[i] if i < len(from_ips) else '?',
+                to_ip=to_ips[i] if i < len(to_ips) else '?',
+                delay=delays[i] if i < len(delays) else 'unknown',
+                data_rate=data_rates[i] if i < len(data_rates) else 'unknown',
+            ))
 
         return ShortestPath(
             from_device=from_name,
