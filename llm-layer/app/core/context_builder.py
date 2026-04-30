@@ -8,6 +8,7 @@ import socket
 import time
 import logging
 import sys
+import json
 from typing import Optional
 from datetime import datetime
 
@@ -54,12 +55,14 @@ class PathHop:
 
 class ShortestPath:
     """Result of a shortest path query."""
-    def __init__(self, from_device, to_device, hops_count, path_devices, hops):
+    def __init__(self, from_device, to_device, hops_count, path_devices, hops, excluded_devices=None, excluded_links=None):
         self.from_device = from_device
         self.to_device = to_device
         self.hops_count = hops_count
         self.path_devices = path_devices
         self.hops = hops or []
+        self.excluded_devices = excluded_devices or []
+        self.excluded_links = excluded_links or []
 
 class TopologyNode:
     def __init__(self, id, type, name, status, ip="", location="", ns3_ips=None, neighbors=None, links=None):
@@ -88,6 +91,11 @@ class ContextBundle:
         self.topology = topology or []
         self.links = links or []
         self.shortest_path = shortest_path
+        self.shortest_path_requested = False
+        self.shortest_path_from = None
+        self.shortest_path_to = None
+        self.shortest_path_exclusions = []
+        self.shortest_path_excluded_links = []
         self.blast_radius = []
         self.timestamp = datetime.now()
 
@@ -396,7 +404,17 @@ class Neo4jBridgeClient:
             pass
         return None
 
-    def get_shortest_path(self, from_id: str, to_id: str) -> Optional[ShortestPath]:
+    @staticmethod
+    def _cypher_string(value: str) -> str:
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    def get_shortest_path(
+        self,
+        from_id: str,
+        to_id: str,
+        excluded_ids: Optional[list[str]] = None,
+        excluded_links: Optional[list[tuple[str, str]]] = None,
+    ) -> Optional[ShortestPath]:
         from_name = self._resolve_device_name(from_id)
         to_name = self._resolve_device_name(to_id)
         if not from_name:
@@ -406,10 +424,40 @@ class Neo4jBridgeClient:
             print(f"❌ Could not resolve target: {to_id}", file=sys.stderr)
             return None
 
+        excluded_names = []
+        for excluded_id in excluded_ids or []:
+            excluded_name = self._resolve_device_name(excluded_id)
+            if excluded_name:
+                excluded_names.append(excluded_name)
+            else:
+                print(f"⚠️ Could not resolve excluded node: {excluded_id}", file=sys.stderr)
+        excluded_names = list(dict.fromkeys(excluded_names))
+        excluded_names_cypher = "[" + ", ".join(self._cypher_string(name) for name in excluded_names) + "]"
+
+        excluded_link_pairs = []
+        for raw_a, raw_b in excluded_links or []:
+            a_name = self._resolve_device_name(raw_a)
+            b_name = self._resolve_device_name(raw_b)
+            if a_name and b_name:
+                pair = (a_name, b_name)
+                reverse_pair = (b_name, a_name)
+                if pair not in excluded_link_pairs and reverse_pair not in excluded_link_pairs:
+                    excluded_link_pairs.append(pair)
+            else:
+                print(f"⚠️ Could not resolve excluded link: {raw_a} ↔ {raw_b}", file=sys.stderr)
+        excluded_links_cypher = "[" + ", ".join(
+            "[" + self._cypher_string(a) + ", " + self._cypher_string(b) + "]"
+            for a, b in excluded_link_pairs
+        ) + "]"
+
         cypher = (
-            f"MATCH (start:NetworkNode {{name: \"{from_name}\"}}), "
-            f"(end:NetworkNode {{name: \"{to_name}\"}}), "
+            f"MATCH (start:NetworkNode {{name: {self._cypher_string(from_name)}}}), "
+            f"(end:NetworkNode {{name: {self._cypher_string(to_name)}}}), "
             f"path = shortestPath((start)-[:CONNECTED_TO*]-(end)) "
+            f"WHERE NONE(node IN nodes(path) WHERE node.name IN {excluded_names_cypher}) "
+            f"AND NONE(rel IN relationships(path) WHERE ANY(pair IN {excluded_links_cypher} WHERE "
+            f"((startNode(rel).name = pair[0] AND endNode(rel).name = pair[1]) OR "
+            f"(startNode(rel).name = pair[1] AND endNode(rel).name = pair[0])))) "
             f"RETURN nodes(path) AS node_list, relationships(path) AS rel_list, length(path) AS hops"
         )
         try:
@@ -479,6 +527,8 @@ class Neo4jBridgeClient:
             hops_count=hops_count,
             path_devices=path_devices,
             hops=path_hops,
+            excluded_devices=excluded_names,
+            excluded_links=excluded_link_pairs,
         )
 
     def get_topology_with_links(self, node_names: Optional[list] = None) -> tuple:
@@ -634,9 +684,20 @@ class ContextBuilder:
             return self._neo4j.get_blast_radius(device_id)
         return []
 
-    def get_shortest_path(self, from_id: str, to_id: str) -> Optional[ShortestPath]:
+    def get_shortest_path(
+        self,
+        from_id: str,
+        to_id: str,
+        excluded_ids: Optional[list[str]] = None,
+        excluded_links: Optional[list[tuple[str, str]]] = None,
+    ) -> Optional[ShortestPath]:
         if self._neo4j:
-            return self._neo4j.get_shortest_path(from_id, to_id)
+            return self._neo4j.get_shortest_path(
+                from_id,
+                to_id,
+                excluded_ids=excluded_ids,
+                excluded_links=excluded_links,
+            )
         return None
 
     def _extract_path_endpoints(self, query: str) -> tuple[Optional[str], Optional[str]]:
@@ -656,6 +717,238 @@ class ContextBuilder:
         if len(devices) >= 2:
             return f"{devices[0][0]}{devices[0][1]}", f"{devices[1][0]}{devices[1][1]}"
         return None, None
+
+    @staticmethod
+    def _normalize_device_identifier(value) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip().strip('"\'.,;:()[]{}')
+        ip_match = IP_RE.search(text)
+        if ip_match:
+            return ip_match.group(0)
+        device_match = DEVICE_ID_RE.search(text)
+        if device_match:
+            return f"{device_match.group(1)}{device_match.group(2)}".lower()
+        return text.lower() if text else None
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Optional[dict]:
+        if not text:
+            return None
+        fence_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL | re.IGNORECASE)
+        candidates = [fence_match.group(1)] if fence_match else []
+        object_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if object_match:
+            candidates.append(object_match.group(0))
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    @staticmethod
+    def _mentioned_identifiers(query: str) -> set[str]:
+        identifiers = {
+            f"{prefix}{number}".lower()
+            for prefix, number in DEVICE_ID_RE.findall(query)
+        }
+        identifiers.update(ip.lower() for ip in IP_RE.findall(query))
+        return identifiers
+
+    def _normalize_link_pair(self, value) -> Optional[tuple[str, str]]:
+        if isinstance(value, dict):
+            first = value.get("from") or value.get("source") or value.get("a") or value.get("node1")
+            second = value.get("to") or value.get("target") or value.get("b") or value.get("node2")
+        elif isinstance(value, (list, tuple)) and len(value) >= 2:
+            first, second = value[0], value[1]
+        else:
+            devices = [
+                f"{prefix}{number}"
+                for prefix, number in DEVICE_ID_RE.findall(str(value))
+            ] + IP_RE.findall(str(value))
+            if len(devices) < 2:
+                return None
+            first, second = devices[0], devices[1]
+        a = self._normalize_device_identifier(first)
+        b = self._normalize_device_identifier(second)
+        if not a or not b or a == b:
+            return None
+        return a, b
+
+    def _extract_path_intent_with_nlp(self, query: str, known_devices: Optional[list[str]] = None) -> dict:
+        known_devices = known_devices or []
+        known_devices_text = ", ".join(known_devices[:120])
+        extraction_prompt = f"""Extract shortest-path query fields from the user text.
+Return ONLY valid JSON. Do not explain.
+
+JSON schema:
+{{
+  "is_shortest_path": true or false,
+  "source": "device_or_ip_or_null",
+  "target": "device_or_ip_or_null",
+  "excluded_nodes": ["device_or_ip"],
+  "excluded_links": [["device_or_ip_a", "device_or_ip_b"]]
+}}
+
+Rules:
+- excluded_nodes means nodes that are down, failed, offline, unavailable, avoided, excluded, blocked, removed, not usable, or should not be passed through.
+- excluded_links means links/connections/edges that are down, failed, offline, unavailable, avoided, excluded, blocked, removed, not usable, or should not be used.
+- If the text says "node r12 is down", put r12 in excluded_nodes.
+- If the text says "link r12 to r2 is down", put ["r12", "r2"] in excluded_links, NOT in excluded_nodes.
+- If the text says "link from r12 to r3 does not work", "doesn't work", "doesnt work", "is broken", or "is not working", put ["r12", "r3"] in excluded_links.
+- Do not put link endpoint devices in excluded_nodes unless the text separately says the node/device/router/switch itself is down or unusable.
+- Include every excluded node and every excluded link mentioned, even if phrased indirectly.
+- Use device names exactly like r12, r34, d8, s21 when present.
+- If source or target is not present, use null.
+
+Known device names: {known_devices_text}
+
+User text: {query}
+JSON:"""
+        prompt = (
+            "<|start_header_id|>system<|end_header_id|>\n"
+            "You extract structured network path parameters. Return only JSON."
+            "<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n"
+            f"{extraction_prompt}"
+            "<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n"
+        )
+        try:
+            from app.core.llm_core import get_llm
+            result = get_llm().generate(
+                prompt=prompt,
+                max_tokens=180,
+                temperature=0.0,
+                stop=["<|eot_id|>", "<|start_header_id|>"],
+            )
+            parsed = self._extract_json_object(result.get("response", ""))
+            if not parsed:
+                return {}
+            exclusions = parsed.get("excluded_nodes") or []
+            if not isinstance(exclusions, list):
+                exclusions = [
+                    f"{prefix}{number}"
+                    for prefix, number in DEVICE_ID_RE.findall(str(exclusions))
+                ] + IP_RE.findall(str(exclusions))
+            excluded_links = parsed.get("excluded_links") or []
+            if not isinstance(excluded_links, list):
+                excluded_links = [excluded_links]
+            return {
+                "is_shortest_path": bool(parsed.get("is_shortest_path", False)),
+                "source": self._normalize_device_identifier(parsed.get("source")),
+                "target": self._normalize_device_identifier(parsed.get("target")),
+                "excluded_nodes": [
+                    normalized
+                    for normalized in (self._normalize_device_identifier(item) for item in exclusions)
+                    if normalized
+                ],
+                "excluded_links": [
+                    pair
+                    for pair in (self._normalize_link_pair(item) for item in excluded_links)
+                    if pair
+                ],
+            }
+        except Exception as e:
+            print(f"⚠️ NLP path extraction failed: {e}", file=sys.stderr)
+            return {}
+
+    @staticmethod
+    def _topology_link_pairs(topology: Optional[list[TopologyNode]]) -> set[frozenset[str]]:
+        pairs = set()
+        for node in topology or []:
+            for link in node.links:
+                if link.from_device and link.to_device:
+                    pairs.add(frozenset([link.from_device.lower(), link.to_device.lower()]))
+        return pairs
+
+    @staticmethod
+    def _node_has_explicit_node_failure(query: str, node: str) -> bool:
+        q = query.lower()
+        node = node.lower()
+        node_terms = ("node", "device", "router", "switch")
+        failure_terms = ("down", "failed", "offline", "unavailable", "inactive", "blocked", "unusable", "not usable")
+        if any(f"{term} {node}" in q for term in node_terms):
+            return True
+        return any(
+            f"{node} {failure}" in q
+            or f"{node} is {failure}" in q
+            or f"{node} went {failure}" in q
+            or f"{failure} {node}" in q
+            for failure in failure_terms
+        )
+
+    def _extract_path_request(
+        self,
+        query: str,
+        known_devices: Optional[list[str]] = None,
+        topology: Optional[list[TopologyNode]] = None,
+    ) -> dict:
+        if not self.is_shortest_path_query(query):
+            return {
+                "is_shortest_path": False,
+                "source": None,
+                "target": None,
+                "excluded_nodes": [],
+                "excluded_links": [],
+            }
+
+        nlp_result = self._extract_path_intent_with_nlp(query, known_devices=known_devices)
+        fallback_from, fallback_to = self._extract_path_endpoints(query)
+
+        from_id = nlp_result.get("source") or fallback_from
+        to_id = nlp_result.get("target") or fallback_to
+        endpoints = (from_id, to_id)
+
+        exclusions = []
+        mentioned_identifiers = self._mentioned_identifiers(query)
+        for excluded in nlp_result.get("excluded_nodes") or []:
+            if excluded and excluded.lower() in mentioned_identifiers:
+                exclusions.append(excluded)
+        endpoint_values = {value.lower() for value in endpoints if value}
+        exclusions = [
+            excluded for excluded in list(dict.fromkeys(exclusions))
+            if excluded.lower() not in endpoint_values
+        ]
+
+        excluded_links = []
+        for pair in nlp_result.get("excluded_links") or []:
+            normalized_pair = self._normalize_link_pair(pair)
+            if not normalized_pair:
+                continue
+            a, b = normalized_pair
+            if a in mentioned_identifiers and b in mentioned_identifiers:
+                excluded_links.append(normalized_pair)
+
+        known_link_pairs = self._topology_link_pairs(topology)
+        if known_link_pairs:
+            excluded_links = [
+                pair for pair in excluded_links
+                if frozenset([pair[0].lower(), pair[1].lower()]) in known_link_pairs
+            ]
+
+        deduped_links = []
+        for pair in excluded_links:
+            reverse_pair = (pair[1], pair[0])
+            if pair not in deduped_links and reverse_pair not in deduped_links:
+                deduped_links.append(pair)
+
+        link_endpoint_nodes = {node for pair in deduped_links for node in pair}
+        if link_endpoint_nodes:
+            exclusions = [
+                node for node in exclusions
+                if node not in link_endpoint_nodes or self._node_has_explicit_node_failure(query, node)
+            ]
+
+        return {
+            "is_shortest_path": bool(nlp_result.get("is_shortest_path")) or self.is_shortest_path_query(query),
+            "source": from_id,
+            "target": to_id,
+            "excluded_nodes": exclusions,
+            "excluded_links": deduped_links,
+        }
 
     def build_context(self, query: str) -> ContextBundle:
         print(f"\n🔍 Building context for: {query[:60]}...", file=sys.stderr)
@@ -688,19 +981,53 @@ class ContextBuilder:
         blast_radius = []
         for node in topology:
             if node.name and node.name.lower() in query.lower():
-                blast_radius.extend(self.get_blast_radius(node.id))
+                blast_radius.extend(self.get_blast_radius(node.name))
         blast_radius = list(set(blast_radius))
 
         shortest_path = None
-        if any(kw in query.lower() for kw in ['shortest path', 'path from', 'path between', 'route from']):
-            from_id, to_id = self._extract_path_endpoints(query)
+        shortest_path_requested = False
+        shortest_path_from = None
+        shortest_path_to = None
+        shortest_path_exclusions = []
+        shortest_path_excluded_links = []
+        path_request = self._extract_path_request(
+            query,
+            known_devices=[n.name for n in all_topology if n.name],
+            topology=all_topology,
+        )
+        if path_request["is_shortest_path"]:
+            from_id = path_request["source"]
+            to_id = path_request["target"]
             if from_id and to_id:
-                print(f"🛤️ Computing shortest path: {from_id} → {to_id}", file=sys.stderr)
-                shortest_path = self.get_shortest_path(from_id, to_id)
+                excluded_ids = path_request["excluded_nodes"]
+                excluded_links = path_request["excluded_links"]
+                shortest_path_requested = True
+                shortest_path_from = from_id
+                shortest_path_to = to_id
+                shortest_path_exclusions = excluded_ids
+                shortest_path_excluded_links = excluded_links
+                excluded_parts = []
+                if excluded_ids:
+                    excluded_parts.append(f"nodes {excluded_ids}")
+                if excluded_links:
+                    excluded_parts.append(f"links {excluded_links}")
+                excluded_note = f" excluding {', '.join(excluded_parts)}" if excluded_parts else ""
+                print(f"🛤️ Computing shortest path: {from_id} → {to_id}{excluded_note}", file=sys.stderr)
+                shortest_path = self.get_shortest_path(
+                    from_id,
+                    to_id,
+                    excluded_ids=excluded_ids,
+                    excluded_links=excluded_links,
+                )
                 if shortest_path:
                     print(f"✅ Path found: {shortest_path.hops_count} hops, {' → '.join(shortest_path.path_devices)}", file=sys.stderr)
 
         bundle = ContextBundle(query, topology, links=all_links, shortest_path=shortest_path)
+        bundle.shortest_path_requested = shortest_path_requested
+        bundle.shortest_path_from = shortest_path_from
+        bundle.shortest_path_to = shortest_path_to
+        bundle.shortest_path_exclusions = shortest_path_exclusions
+        bundle.shortest_path_excluded_links = shortest_path_excluded_links
         bundle.blast_radius = blast_radius
         print(f"✅ Context built: {len(topology)} nodes, {len(all_links)} links, blast_radius={blast_radius}, path={'yes' if shortest_path else 'no'}\n", file=sys.stderr)
         return bundle
@@ -722,6 +1049,54 @@ class ContextBuilder:
             return float(data_rate_str.lower().replace('gbps', '').replace('mbps', '').strip())
         except ValueError:
             return 0.0
+
+    @staticmethod
+    def is_shortest_path_query(query: str) -> bool:
+        q = query.lower()
+        return any(kw in q for kw in ['shortest path', 'path from', 'path between', 'route from'])
+
+    def format_shortest_path_response(self, bundle: ContextBundle) -> Optional[str]:
+        sp = bundle.shortest_path
+        if not sp:
+            if not bundle.shortest_path_requested:
+                return None
+            avoid_parts = []
+            if bundle.shortest_path_exclusions:
+                avoid_parts.append(", ".join(bundle.shortest_path_exclusions))
+            if bundle.shortest_path_excluded_links:
+                avoid_parts.append(", ".join(f"{a} ↔ {b}" for a, b in bundle.shortest_path_excluded_links))
+            exclusion_text = f" avoiding {'; '.join(avoid_parts)}" if avoid_parts else ""
+            return f"No shortest path was found from {bundle.shortest_path_from} to {bundle.shortest_path_to}{exclusion_text}."
+
+        lines = []
+        avoid_parts = []
+        if sp.excluded_devices:
+            avoid_parts.append(", ".join(sp.excluded_devices))
+        if sp.excluded_links:
+            avoid_parts.append(", ".join(f"{a} ↔ {b}" for a, b in sp.excluded_links))
+        if avoid_parts:
+            lines.append(f"Shortest path from {sp.from_device} to {sp.to_device}, avoiding {'; '.join(avoid_parts)}:")
+        else:
+            lines.append(f"Shortest path from {sp.from_device} to {sp.to_device}:")
+
+        lines.append(f"{' → '.join(sp.path_devices)}")
+        lines.append(f"Hops: {sp.hops_count}")
+
+        if sp.hops:
+            total_delay = sum(self._parse_delay_ms(h.delay) for h in sp.hops)
+            rates = [self._parse_data_rate_gbps(h.data_rate) for h in sp.hops]
+            bottleneck = min(rates) if rates else 0
+            lines.append(f"Total delay: {total_delay:.0f}ms")
+            lines.append(f"Bottleneck bandwidth: {bottleneck:.0f}Gbps")
+            lines.append("")
+            lines.append("Hop-by-hop:")
+            for hop in sp.hops:
+                lines.append(
+                    f"{hop.hop_num}. {hop.from_device} → {hop.to_device} | "
+                    f"{hop.from_ip} → {hop.to_ip} | delay: {hop.delay} | rate: {hop.data_rate}"
+                )
+
+        return "\n".join(lines)
 
     def summarize_context(self, bundle: ContextBundle) -> str:
         lines = []
@@ -791,6 +1166,10 @@ class ContextBuilder:
             sp = bundle.shortest_path
             lines.append("")
             lines.append(f"=== SHORTEST PATH: {sp.from_device} → {sp.to_device} ===")
+            if sp.excluded_devices:
+                lines.append(f"EXCLUDED DEVICES: {', '.join(sp.excluded_devices)}")
+            if sp.excluded_links:
+                lines.append(f"EXCLUDED LINKS: {', '.join(f'{a}↔{b}' for a, b in sp.excluded_links)}")
             lines.append(f"HOPS: {sp.hops_count}")
             lines.append(f"DEVICES IN ORDER: {' → '.join(sp.path_devices)}")
             if sp.hops:

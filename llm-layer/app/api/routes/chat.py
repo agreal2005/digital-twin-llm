@@ -56,6 +56,19 @@ async def chat(request: ChatRequest):
         context_builder = get_context_builder()
         context_bundle  = context_builder.build_context(request.query)
 
+        shortest_path_response = context_builder.format_shortest_path_response(context_bundle)
+        if shortest_path_response:
+            total_latency_ms = (time.time() - start_time) * 1000
+            return ChatResponse(
+                response             = shortest_path_response,
+                intent               = "informational",
+                confidence           = 1.0,
+                tokens_used          = 0,
+                latency_ms           = round(total_latency_ms, 2),
+                human_review_required= False,
+                approval_status      = None,
+            )
+
         # ----------------------------------------------------------
         # 2. Build prompt
         # ----------------------------------------------------------
