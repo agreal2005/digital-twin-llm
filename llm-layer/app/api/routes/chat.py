@@ -38,6 +38,7 @@ from app.core.prompt_engine     import get_prompt_engine
 from app.core.intent_parser     import get_intent_parser
 from app.core.response_formatter import get_response_formatter
 from app.core.human_verification import get_human_verification
+from app.core.chroma_config_history import get_config_history_service
 from app.services.control_layer  import get_control_layer
 
 router = APIRouter()
@@ -50,6 +51,23 @@ async def chat(request: ChatRequest):
     logger.info(f"📝 Query: {request.query[:80]}...")
 
     try:
+        # ----------------------------------------------------------
+        # 0. ChromaDB config-history lookup
+        # ----------------------------------------------------------
+        config_history = get_config_history_service()
+        if config_history.is_config_history_query(request.query):
+            response = config_history.answer(request.query)
+            total_latency_ms = (time.time() - start_time) * 1000
+            return ChatResponse(
+                response             = response,
+                intent               = "informational",
+                confidence           = 1.0,
+                tokens_used          = 0,
+                latency_ms           = round(total_latency_ms, 2),
+                human_review_required= False,
+                approval_status      = None,
+            )
+
         # ----------------------------------------------------------
         # 1. Build context
         # ----------------------------------------------------------
